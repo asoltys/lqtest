@@ -1,0 +1,16 @@
+{
+  "name": "lqtest",
+  "type": "module",
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "dependencies": {
+    "@noble/secp256k1": "^2.1.0",
+    "@scure/btc-signer": "link:@scure/btc-signer",
+    "ecpair": "^2.1.0",
+    "liquidjs-lib": "^6.0.2-liquid.32",
+    "micro-packed": "^0.6.3",
+    "tiny-secp256k1": "^2.2.1",
+    "uint8array-extras": "^1.0.0"
+  }
+}
