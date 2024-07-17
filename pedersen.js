@@ -1,12 +1,5 @@
 import { ProjectivePoint, etc, utils, CURVE } from "@noble/secp256k1";
 
-// A signed 30-bit limb representation of integers in JavaScript
-class ModInv32Signed30 {
-  constructor() {
-    this.v = new Int32Array(9);
-  }
-}
-
 const scalarFromSigned30 = (a) => {
   const r = new Uint32Array(8);
 
@@ -49,7 +42,6 @@ const scalarFromSigned30 = (a) => {
 };
 
 // Constants
-const UINT32_MAX = 0xffffffff;
 const MODINV32_INV256 = new Uint8Array(128); // This array should be initialized with appropriate values
 
 // Function to count trailing zeros in a 32-bit integer
@@ -77,16 +69,6 @@ const ctz32 = (x) => {
   }
   return n;
 };
-
-// Transformation matrix class
-class Trans2x2 {
-  constructor() {
-    this.u = 1;
-    this.v = 0;
-    this.q = 0;
-    this.r = 1;
-  }
-}
 
 // Function to compute transition matrix and eta for 30 posdivsteps
 const modinv32Posdivsteps30Var = (eta, f0, g0, t, jacp) => {
@@ -169,14 +151,63 @@ let testmodinv32Posdivsteps30Var = () => {
   console.log(`Jacobi symbol: ${jacp}`);
 };
 
-// Constants
-const M30 = 0x3fffffff; // (UINT32_MAX >> 2)
+const M30 = 0x3FFFFFFF; // (UINT32_MAX >> 2)
+const UINT32_MAX = 0xFFFFFFFF;
 
 // Helper function to verify a condition
-const VERIFY_CHECK = (condition) => {
+const VERIFY_CHECK = (condition, message) => {
   if (!condition) {
-    throw new Error("Verification failed");
+    throw new Error(message || "Verification failed");
   }
+};
+
+// A signed 30-bit limb representation of integers in JavaScript
+class ModInv32Signed30 {
+  constructor() {
+    this.v = new Int32Array(9);
+  }
+}
+
+// Transformation matrix class
+class Trans2x2 {
+  constructor() {
+    this.u = 1;
+    this.v = 0;
+    this.q = 0;
+    this.r = 1;
+  }
+}
+
+// Helper function to convert uint16 to signed30
+const uint16ToSigned30 = (out, inp) => {
+  for (let i = 0; i < 9; i++) {
+    out.v[i] = 0;
+  }
+  for (let i = 0; i < 16; i++) {
+    const j = Math.floor(i / 2);
+    if (i % 2 === 0) {
+      out.v[j] += inp[i];
+    } else {
+      out.v[j] += inp[i] << 16;
+    }
+  }
+  console.log(`Before normalization: ${out.v}`);
+  // Normalize the values to ensure they fit within 30 bits
+  for (let i = 0; i < 9; i++) {
+    VERIFY_CHECK(out.v[i] <= M30, `Value out of range: ${out.v[i]} at index ${i}`);
+    out.v[i] &= M30;
+  }
+  console.log(`uint16ToSigned30 output for input ${inp}: ${out.v}`);
+};
+
+
+// Function to normalize the input values
+const normalizeSigned30 = (value) => {
+  const result = new Int32Array(9);
+  for (let i = 0; i < value.length; ++i) {
+    result[i] = value[i] & M30;
+  }
+  return result;
 };
 
 // Function to update f and g using a transition matrix t
@@ -197,22 +228,30 @@ const modinv32UpdateFg30Var = (len, f, g, t) => {
   cf = BigInt(u) * BigInt(fi) + BigInt(v) * BigInt(gi);
   cg = BigInt(q) * BigInt(fi) + BigInt(r) * BigInt(gi);
 
-  console.log(cf, BigInt(M30), M30, Number(cf & BigInt(M30)))
-  // Verify that the bottom 62 bits of the result are zero, and then throw them away
-  VERIFY_CHECK(Number(cf & BigInt(M30)) === 0);
+  console.log(`Initial cf: ${cf}, cg: ${cg}`);
+  console.log(`Mask M30: ${BigInt(M30)}`);
+
+  // Verify that the bottom 30 bits of the result are zero, and then throw them away
+  console.log(`Bottom 30 bits of cf: ${Number(cf & BigInt(M30))}`);
+  VERIFY_CHECK((cf & BigInt(M30)) === 0n, `Initial cf verification failed: ${cf}`);
   cf >>= 30n;
-  VERIFY_CHECK(Number(cg & BigInt(M30)) === 0);
+  console.log(`Bottom 30 bits of cg: ${Number(cg & BigInt(M30))}`);
+  VERIFY_CHECK((cg & BigInt(M30)) === 0n, `Initial cg verification failed: ${cg}`);
   cg >>= 30n;
 
   // Iteratively compute limb i=1..len of t*[f,g], and store them in output limb i-1 (shifting down by 30 bits)
   for (i = 1; i < len; ++i) {
     fi = f.v[i];
     gi = g.v[i];
+    console.log(`Iteration ${i} before: cf=${cf}, cg=${cg}, fi=${fi}, gi=${gi}`);
     cf += BigInt(u) * BigInt(fi) + BigInt(v) * BigInt(gi);
     cg += BigInt(q) * BigInt(fi) + BigInt(r) * BigInt(gi);
+    console.log(`Iteration ${i} after: cf=${cf}, cg=${cg}`);
     f.v[i - 1] = Number(cf & BigInt(M30));
+    console.log(`f.v[${i - 1}]: ${f.v[i - 1]}`);
     cf >>= 30n;
     g.v[i - 1] = Number(cg & BigInt(M30));
+    console.log(`g.v[${i - 1}]: ${g.v[i - 1]}`);
     cg >>= 30n;
   }
 
@@ -221,23 +260,51 @@ const modinv32UpdateFg30Var = (len, f, g, t) => {
   g.v[len - 1] = Number(cg);
 };
 
-let testmodinv32UpdateFg30Var = () => {
-  // Example usage
+const testModinv32UpdateFg30Var = () => {
+  const inArray = new Uint16Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  const modArray = new Uint16Array([9, 8, 7, 6, 5, 4, 3, 2, 1]);
+  const outArray = new Uint16Array(9);
+
   const f = new ModInv32Signed30();
   const g = new ModInv32Signed30();
   const t = new Trans2x2();
-  f.v = Int32Array.from([1, 2, 3, 4, 5, 6, 7, 8, 9]);
-  g.v = Int32Array.from([9, 8, 7, 6, 5, 4, 3, 2, 1]);
+
+  uint16ToSigned30(f, inArray);
+  uint16ToSigned30(g, modArray);
+
+  console.log("Initial f:", f);
+  console.log("Initial g:", g);
+
+  // Properly initialize t
   t.u = 1;
-  t.v = 2;
-  t.q = 3;
-  t.r = 4;
+  t.v = 0;
+  t.q = 0;
+  t.r = 1;
 
   modinv32UpdateFg30Var(9, f, g, t);
-  console.log(f.v);
-  console.log(g.v);
+
+  signed30ToUint16(outArray, f);
+  console.log("Output f:", outArray);
+  signed30ToUint16(outArray, g);
+  console.log("Output g:", outArray);
 };
-console.log(testmodinv32UpdateFg30Var());
+
+testModinv32UpdateFg30Var();
+
+// Function to convert signed30 to uint16 for verification
+const signed30ToUint16 = (out, inp) => {
+  for (let i = 0; i < 16; i++) {
+    const j = Math.floor(i / 2);
+    if (i % 2 === 0) {
+      out[i] = inp.v[j] & 0xFFFF;
+    } else {
+      out[i] = (inp.v[j] >> 16) & 0xFFFF;
+    }
+  }
+};
+
+// Run the test
+testModinv32UpdateFg30Var();
 
 // compute Jacobi symbol
 const jacobiSymbol = (a, n) => {
