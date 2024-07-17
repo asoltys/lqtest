@@ -61,6 +61,7 @@ function isSquare(fe) {
 function pedersenCommitmentSave(commit, ge) {
   // Normalize x-coordinate and convert to bytes
   const xBytes = normalizeAndConvertToBytes(ge.x);
+  console.log(xBytes)
 
   // Check if y-coordinate is a square
   const yIsSquare = isSquare(ge.y);
