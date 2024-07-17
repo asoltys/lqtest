@@ -81,6 +81,7 @@ const blindHex = "8b5d87d94b9f54dc5dd9f31df5dffedc974fc4d5bf0d2ee1297e5aba504ccc
 const blindBytes = etc.hexToBytes(blindHex);
 const blindingFactor = etc.bytesToNumberBE(blindBytes);
 const B = ProjectivePoint.BASE.multiply(blindingFactor);
+const expectedHex = "08a9de5e391458abf4eb6ff0cc346fa0a8b5b0806b2ee9261dde54d436423c1982";
 
 const genHex = "02a4fd25e0e2108e55aec683810a8652f9b067242419a1f7cc0f01f92b4b078252";
 const value = 10000n;
@@ -88,12 +89,12 @@ const value = 10000n;
 const G2 = ProjectivePoint.fromHex(genHex);
 const V = G2.multiply(value);
 
-print("B", B);
-print("V", V);
-print("B + V", V.add(B));
+// print("B", B);
+// print("V", V);
+// print("B + V", V.add(B));
 
 // Save the commitment
 const commitment = {};
 pedersenCommitmentSave(commitment, V.add(B));
 
-console.log("Commitment:", etc.bytesToHex(commitment.data));
+console.log("Commitment matches expected:", etc.bytesToHex(commitment.data) === expectedHex);
