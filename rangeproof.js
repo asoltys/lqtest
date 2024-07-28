@@ -1,7 +1,13 @@
-import { ProjectivePoint, etc, CURVE } from "@noble/secp256k1";
+import { ProjectivePoint, etc, CURVE, hmacDrbg } from "@noble/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
-
-const { bytesToHex, bytesToNumberBE, hexToBytes, numberToBytesBE } = etc;
+const {
+  bytesToHex: b2h,
+  bytesToNumberBE: b2n,
+  hexToBytes: h2b,
+  numberToBytesBE: n2b,
+} = etc;
+const { BASE: G, ZERO: I } = ProjectivePoint;
+const { n: N } = CURVE;
 
 // Modular exponentiation function
 const modPow = (base, exp, mod) => {
@@ -40,7 +46,27 @@ const sqrt = (n) => {
 
 // Function to normalize and convert field element to bytes
 function normalizeAndConvertToBytes(fe) {
-  return numberToBytesBE(fe).slice(0, 32);
+  return n2b(fe).slice(0, 32);
+}
+
+
+// Function to serialize a point according to the custom format
+function serializePoint(point) {
+  const data = new Uint8Array(33);
+
+  // Check if y is a square
+  const yBigInt = BigInt(point.y);
+  data[0] = isSquare(yBigInt) ? 0x00 : 0x01;
+
+  // Normalize x
+  const xBigInt = BigInt(point.x);
+  const xHex = xBigInt.toString(16).padStart(64, '0'); // Convert x to 32-byte hex string
+  const xBytes = Uint8Array.from(Buffer.from(xHex, 'hex')); // Convert hex string to Uint8Array
+
+  // Serialize x
+  data.set(xBytes, 1);
+
+  return data;
 }
 
 // Function to check if a field element is a quadratic residue
@@ -61,7 +87,7 @@ function isSquare(fe) {
 }
 
 // JavaScript implementation of secp256k1_pedersen_commitment_save
-function pedersenCommitmentSave(commit, ge) {
+function pedersenCommitment(ge) {
   // Normalize x-coordinate and convert to bytes
   const xBytes = normalizeAndConvertToBytes(ge.x);
 
@@ -72,9 +98,10 @@ function pedersenCommitmentSave(commit, ge) {
   const prefixByte = 9 ^ (yIsSquare ? 1 : 0);
 
   // Prepare the commitment data
-  commit.data = new Uint8Array(33);
-  commit.data[0] = prefixByte;
-  commit.data.set(xBytes, 1);
+  let commit = new Uint8Array(33);
+  commit[0] = prefixByte;
+  commit.set(xBytes, 1);
+  return commit;
 }
 
 const print = (label, p) =>
@@ -87,9 +114,9 @@ const print = (label, p) =>
 function testPedersen() {
   const blindHex =
     "8b5d87d94b9f54dc5dd9f31df5dffedc974fc4d5bf0d2ee1297e5aba504ccc26";
-  const blindBytes = hexToBytes(blindHex);
-  const blindingFactor = bytesToNumberBE(blindBytes);
-  const B = ProjectivePoint.BASE.multiply(blindingFactor);
+  const blindBytes = h2b(blindHex);
+  const blindingFactor = b2n(blindBytes);
+  const B = G.multiply(blindingFactor);
   const expectedHex =
     "08a9de5e391458abf4eb6ff0cc346fa0a8b5b0806b2ee9261dde54d436423c1982";
 
@@ -105,13 +132,8 @@ function testPedersen() {
   // print("B + V", V.add(B));
 
   // Save the commitment
-  const commitment = {};
-  pedersenCommitmentSave(commitment, V.add(B));
-
-  console.log(
-    "Commitment matches expected:",
-    bytesToHex(commitment.data) === expectedHex,
-  );
+  let commit = pedersenCommitment(V.add(B));
+  console.log("Commitment matches expected:", b2h(commit) === expectedHex);
 }
 
 function borromeanHash(m, e, ridx, eidx) {
@@ -138,8 +160,8 @@ function borromeanHash(m, e, ridx, eidx) {
 }
 
 function testBorromeanHash() {
-  const message = new Uint8Array([
-    /* message data */
+  const msg = new Uint8Array([
+    /* msg data */
   ]);
   const e = new Uint8Array([
     /* e data */
@@ -147,8 +169,8 @@ function testBorromeanHash() {
   const ridx = 1; // example ring index
   const eidx = 2; // example element index
 
-  hash = borromeanHash(message, e, ridx, eidx);
-  console.log(bytesToHex(hash));
+  hash = borromeanHash(msg, e, ridx, eidx);
+  console.log(b2h(hash));
 }
 
 function clz64(x) {
@@ -161,107 +183,75 @@ function clz64(x) {
   return n;
 }
 
-function rangeProveParams(
-  v,
-  rings,
-  rsizes,
-  npub,
-  secidx,
-  minValue,
-  mantissa,
-  scale,
-  exp,
-  minBits,
-  value,
-) {
-  let i;
-  rings.value = 1;
+function rangeProveParams(minBits, minValue, exp, value) {
+  let i, v;
+  let rsizes = new Array(32);
+  let secidx = new Array(32);
+  let rings = 1;
   rsizes[0] = 1;
   secidx[0] = 0;
-  scale.value = 1n;
-  mantissa.value = 0;
-  npub.value = 0;
+  let scale = 1n;
+  let mantissa = 0;
+  let npub = 0;
 
-  if (minValue.value === 0xffffffffffffffffn) {
-    exp.value = -1;
+  if (minValue === 0xffffffffffffffffn) {
+    exp = -1;
   }
 
-  if (exp.value >= 0) {
+  if (exp >= 0) {
     let maxBits;
     let v2;
     if (
-      (minValue.value && value > 0x7fffffffffffffffn) ||
-      (value && minValue.value >= 0x7fffffffffffffffn)
+      (minValue && value > 0x7fffffffffffffffn) ||
+      (value && minValue >= 0x7fffffffffffffffn)
     ) {
       return 0;
     }
-    maxBits = minValue.value ? clz64(minValue.value) : 64;
-    if (minBits.value > maxBits) {
-      minBits.value = maxBits;
+    maxBits = minValue ? clz64(BigInt(minValue)) : 64;
+    if (minBits > maxBits) {
+      minBits = maxBits;
     }
-    if (minBits.value > 61 || value > 0x7fffffffffffffffn) {
-      exp.value = 0;
+    if (minBits > 61 || value > 0x7fffffffffffffffn) {
+      exp = 0;
     }
-    v.value = value - minValue.value;
-    v2 = minBits.value ? 0xffffffffffffffffn >> BigInt(64 - minBits.value) : 0n;
-    for (i = 0; i < exp.value && v2 <= 0xffffffffffffffffn / 10n; i++) {
-      v.value /= 10n;
+    v = value - BigInt(minValue);
+    v2 = minBits ? 0xffffffffffffffffn >> BigInt(64 - minBits) : 0n;
+    for (i = 0; i < exp && v2 <= 0xffffffffffffffffn / 10n; i++) {
+      v /= 10n;
       v2 *= 10n;
     }
-    exp.value = i;
-    v2 = v.value;
-    for (i = 0; i < exp.value; i++) {
+    exp = i;
+    v2 = v;
+    for (i = 0; i < exp; i++) {
       v2 *= 10n;
-      scale.value *= 10n;
+      scale *= 10n;
     }
-    minValue.value = value - v2;
-    mantissa.value = v.value ? 64 - clz64(v.value) : 1;
-    if (minBits.value > mantissa.value) {
-      mantissa.value = minBits.value;
+    minValue = value - v2;
+    mantissa = v ? 64 - clz64(v) : 1;
+    if (minBits > mantissa) {
+      mantissa = minBits;
     }
-    rings.value = (mantissa.value + 1) >> 1;
-    for (i = 0; i < rings.value; i++) {
-      rsizes[i] = i < rings.value - 1 || !(mantissa.value & 1) ? 4 : 2;
-      npub.value += rsizes[i];
-      secidx[i] = Number((v.value >> BigInt(i * 2)) & 3n);
+    rings = (mantissa + 1) >> 1;
+    for (i = 0; i < rings; i++) {
+      rsizes[i] = i < rings - 1 || !(mantissa & 1) ? 4 : 2;
+      npub += rsizes[i];
+      secidx[i] = Number((v >> BigInt(i * 2)) & 3n);
     }
-    if (mantissa.value <= 0) throw new Error("Invalid mantissa value");
-    if (
-      (v.value & ~(0xffffffffffffffffn >> BigInt(64 - mantissa.value))) !==
-      0n
-    )
+    if (mantissa <= 0) throw new Error("Invalid mantissa value");
+    if ((v & ~(0xffffffffffffffffn >> BigInt(64 - mantissa))) !== 0n)
       throw new Error("Did not get all the bits");
   } else {
-    exp.value = 0;
-    minValue.value = value;
-    v.value = 0n;
-    npub.value = 2;
+    exp = 0;
+    minValue = value;
+    v = 0n;
+    npub = 2;
   }
 
-  if (v.value * scale.value + minValue.value !== value)
-    throw new Error("Invalid value");
-  if (rings.value <= 0 || rings.value > 32)
-    throw new Error("Invalid number of rings");
-  if (npub.value > 128) throw new Error("Invalid number of public keys");
+  if (v * scale + minValue !== value) throw new Error("Invalid value");
+  if (rings <= 0 || rings > 32) throw new Error("Invalid number of rings");
+  if (npub > 128) throw new Error("Invalid number of public keys");
 
-  return 1;
-}
-
-function testProveParams() {
-  const v = { value: 0n };
-  const rings = { value: 0 };
-  const rsizes = new Array(32).fill(0);
-  const npub = { value: 0 };
-  const secidx = new Array(32).fill(0);
-  const minValue = { value: 0n };
-  const mantissa = { value: 0 };
-  const scale = { value: 0n };
-  const exp = { value: 0 };
-  const minBits = { value: 0 };
-  const value = 1000n;
-
-  const result = rangeProveParams(
-    v,
+  return {
     rings,
     rsizes,
     npub,
@@ -269,41 +259,10 @@ function testProveParams() {
     minValue,
     mantissa,
     scale,
-    exp,
     minBits,
-    value,
-  );
-  console.log(result);
-  console.log({
     v,
-    rings,
-    rsizes,
-    npub,
-    secidx,
-    minValue,
-    mantissa,
-    scale,
     exp,
-    minBits,
-  });
-}
-
-function testRange() {
-  const value = 123455000n;
-  const minval = 1;
-  const exp = 0;
-  const bits = 36;
-  const valueCommitment =
-    "0953c4bf412d07fad5e05fe0f5ea2107a546f9cfef38ef2b962ffd84a89de03d7f";
-  const assetCommitment =
-    "0a8d276fa2ab45fed0f622f818be77f456baa2f3b90456e30d2c561446b25b5458";
-  const valueBlinder =
-    "de22de5f5fe49cc6ac2bb8952567151c7c36b42e2e2f2aa587d4ed2060b2ba4d";
-  const nonce =
-    "f295f2c7a42274f8f90a9d7f8649d78b67e693703246bf6086653c8646a363f5";
-  const script = "a914d7da691a2b7256aa3bce759ef2b8ff5213fa327987";
-  const msg =
-    "25b251070e29ca19043cf33ccd7324e2ddab03ecc4ae0b5e77c4fc0e5cf6c95ac4681a2583b714a31c5a0b997a6c107a96be4aef4847d9cde3035e8ef23642bf";
+  };
 }
 
 function borromeanSign(e0, s, pubs, k, sec, rsizes, secidx, nrings, m) {
@@ -315,19 +274,18 @@ function borromeanSign(e0, s, pubs, k, sec, rsizes, secidx, nrings, m) {
     throw new Error("Invalid input");
   }
 
-  console.log("e0 initial:", bytesToHex(e0));
   // console.log("Parameters:");
   // for (let i = 0; i < nrings; i++) {
   //   console.log("I", i);
-  //   console.log("s:", bytesToHex(s[i]));
+  //   console.log("s:", b2h(s[i]));
   //   console.log("pubs:", pubs[i].toHex(true));
   //   console.log("k:", k[i].toString(16));
-  //   console.log("sec:", bytesToHex(sec[i]));
+  //   console.log("sec:", b2h(sec[i]));
   // }
   // console.log("rsizes:", rsizes);
   // console.log("secidx:", secidx);
   // console.log("nrings:", nrings);
-  // console.log("m:", bytesToHex(m));
+  // console.log("m:", b2h(m));
   // console.log("mlen:", m.length);
 
   const sha256_e0 = sha256.create();
@@ -336,7 +294,7 @@ function borromeanSign(e0, s, pubs, k, sec, rsizes, secidx, nrings, m) {
       throw new Error("Integer overflow");
     }
 
-    rgej = ProjectivePoint.BASE.multiply(k[i]);
+    rgej = G.mul(k[i]);
     if (rgej.equals(ProjectivePoint.ZERO)) {
       console.log("zero");
       return 0;
@@ -346,30 +304,26 @@ function borromeanSign(e0, s, pubs, k, sec, rsizes, secidx, nrings, m) {
 
     for (let j = secidx[i] + 1; j < rsizes[i]; j++) {
       tmp = borromeanHash(m, tmp, i, j);
-      let ens = bytesToNumberBE(tmp);
+      let ens = b2n(tmp);
       if (ens >= CURVE.n) ens = ens % CURVE.n;
 
-      rgej = pubs[count + j]
-        .multiply(ens)
-        .add(ProjectivePoint.BASE.multiply(bytesToNumberBE(s[count + j])));
+      rgej = pubs[count + j].multiply(ens).add(G.mul(b2n(s[count + j])));
       if (rgej.equals(ProjectivePoint.ZERO)) {
         console.log("rgej = 0");
         return 0;
       }
 
       tmp = rgej.toRawBytes(true);
-      console.log("tmp", bytesToHex(tmp));
     }
 
     sha256_e0.update(tmp);
     count += rsizes[i];
   }
 
-  console.log("last m", bytesToHex(m));
+  console.log("last m", b2h(m));
   sha256_e0.update(m);
   let digest = sha256_e0.digest();
   e0.set(digest);
-  console.log("e0 after sha256:", bytesToHex(e0), bytesToHex(digest));
 
   count = 0;
   for (let i = 0; i < nrings; i++) {
@@ -378,33 +332,31 @@ function borromeanSign(e0, s, pubs, k, sec, rsizes, secidx, nrings, m) {
     }
 
     borromeanHash(tmp, m, e0, i, 0);
-    let ens = bytesToNumberBE(tmp);
+    let ens = b2n(tmp);
 
     if (ens === 0n || ens >= CURVE.n) {
       return 0;
     }
 
     for (let j = 0; j < secidx[i]; j++) {
-      rgej = pubs[count + j]
-        .multiply(ens)
-        .add(ProjectivePoint.BASE.multiply(s[count + j]));
+      rgej = pubs[count + j].multiply(ens).add(G.mul(s[count + j]));
       if (rgej.equals(ProjectivePoint.ZERO)) {
         return 0;
       }
 
       tmp = rgej.toRawBytes(true);
       borromeanHash(tmp, m, tmp, i, j + 1);
-      ens = bytesToNumberBE(tmp);
+      ens = b2n(tmp);
 
       if (ens === 0n || ens >= CURVE.n) {
         return 0;
       }
     }
 
-    const secScalar = bytesToNumberBE(sec[i]);
+    const secScalar = b2n(sec[i]);
     const kScalar = k[i];
     const newS = mod(ens * secScalar + kScalar, CURVE.n);
-    s[count + secidx[i]] = numberToBytesBE(newS, 32);
+    s[count + secidx[i]] = n2b(newS, 32);
 
     if (newS === 0n) {
       return 0;
@@ -415,7 +367,7 @@ function borromeanSign(e0, s, pubs, k, sec, rsizes, secidx, nrings, m) {
 
   // console.log("Final s values:");
   // for (let i = 0; i < count; i++) {
-  //   console.log("s:", bytesToHex(s[i]));
+  //   console.log("s:", b2h(s[i]));
   // }
 
   return 1;
@@ -501,7 +453,7 @@ function testBorromeanSign() {
     "37e808816573f7c73b3f225d09b29e03fe9ae9f79c40e69eb466fc3cafc5cdc0",
     "450b46d575fdee83001a755b61fe4e4cd98fa880ebd4b6f3904716ac3a619a42",
     "e1800c7360563410f703163e2b8975cd8d272f58768ebed263ee8a8381054d81",
-  ].map(hexToBytes);
+  ].map(h2b);
 
   const pubs = [
     "03f0954c84cd6f383a536677e4279108eed11f62d2a5b1e3f15c622c850c0ad11f",
@@ -598,8 +550,8 @@ function testBorromeanSign() {
     "c80d7abae240c92faa6985ed51d9038ad7ae905ee8521770cff252de21fe83cc",
     "b292abfb9e08bf06c4cb38ba178421ac93f3d050cc3133253b05c64c7a987fb8",
   ]
-    .map(hexToBytes)
-    .map(bytesToNumberBE);
+    .map(h2b)
+    .map(b2n);
 
   const sec = [
     "fcd1e9fba166f36d78f934a4d2719c641e7d5dcd6cba35ccb981fbe364a12ca2",
@@ -620,7 +572,7 @@ function testBorromeanSign() {
     "a1df09eec44924ad0b5d9853b7e325f9a8e9e75c6e15e56706da2444567d66e5",
     "88eea0de4485a181ed41a2fd0e2bdecc409ddca9221e2298744f2d2b831e9c38",
     "33c96c89a5f874eec54b6e9c7b66fe46364b58dce0b1bfa5eb3f6ae71d71ac6a",
-  ].map(hexToBytes);
+  ].map(h2b);
 
   const rsizes = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4];
   const secidx = [3, 1, 1, 0, 2, 1, 0, 3, 3, 2, 1, 1, 3, 1, 0, 0, 0, 0];
@@ -713,7 +665,408 @@ function testBorromeanSign() {
   // Example usage
   const result = borromeanSign(e0, s, pubs, k, sec, rsizes, secidx, nrings, m);
   console.log("e0 expected", e0Final);
-  console.log("e0 actual", bytesToHex(e0));
+  console.log("e0 actual", b2h(e0));
 }
 
-testBorromeanSign();
+// testBorromeanSign();
+
+async function rangeproofGenrand(
+  sec,
+  s,
+  message,
+  rsizes,
+  rings,
+  nonce,
+  commit,
+  proof,
+  len,
+  gen,
+) {
+  let tmp = new Uint8Array(32);
+  let rngseed = new Uint8Array(32 + 33 + 33 + len);
+  let acc = 0n;
+  let overflow;
+  let ret = 1;
+  let npub = 0;
+
+  if (len > 10) {
+    throw new Error("Invalid length");
+  }
+
+  let genP = ProjectivePoint.fromHex(gen);
+  let commitP = ProjectivePoint.fromHex(commit);
+  rngseed.set(h2b(nonce).slice(0, 32), 0);
+  rngseed.set(serializePoint(commitP), 32);
+  rngseed.set(serializePoint(genP), 32 + 33);
+  rngseed.set(proof.slice(0, len), 32 + 33 + 33);
+
+  console.log("nonce", nonce)
+  console.log("commit", commit)
+  console.log("gen", gen)
+
+  let expectedRngseed =
+    "f295f2c7a42274f8f90a9d7f8649d78b67e693703246bf6086653c8646a363f50153c4bf412d07fad5e05fe0f5ea2107a546f9cfef38ef2b962ffd84a89de03d7f008d276fa2ab45fed0f622f818be77f456baa2f3b90456e30d2c561446b25b545860230000000000000001";
+  console.log("EXPECT", expectedRngseed)
+  console.log("ACTUAL", b2h(rngseed))
+  for (let i = 0; i < expectedRngseed.length; i++) {
+    if (expectedRngseed[i] !== b2h(rngseed)[i]) console.log("MISMATCH", i, expectedRngseed[i], b2h(rngseed)[i]);
+  }
+
+  let rng = await sha256(rngseed);
+
+  console.log("RINGS", rings);
+  console.log("rsizes", rsizes);
+  console.log("RNG", b2h(rng));
+
+  for (let i = 0; i < rings; i++) {
+    if (i < rings - 1) {
+      tmp = await sha256(rng);
+      console.log("tmp", i, b2h(tmp))
+      do {
+        tmp = await sha256(rng);
+        sec[i] = b2n(tmp) % N;
+      } while (sec[i] === 0n);
+      acc += sec[i];
+
+      console.log(`SEC[${i}]`, b2h(n2b(sec[i])))
+    } else {
+      sec[i] = -acc % N;
+    }
+
+    for (let j = 0; j < rsizes[i]; j++) {
+      tmp = await sha256(rng);
+      if (message) {
+        for (let b = 0; b < 32; b++) {
+          tmp[b] ^= message[(i * 4 + j) * 32 + b];
+          message[(i * 4 + j) * 32 + b] = tmp[b];
+        }
+      }
+      s[npub] = b2n(tmp);
+      ret &= !(s[npub] === 0n);
+      npub++;
+    }
+  }
+  acc = 0n;
+  return ret;
+}
+
+function rangeproofPubExpand(pubs, exp, rsizes, rings, genp) {
+  var base = secp256k1.ProjectivePoint.fromAffine(genp);
+  var i, j, npub;
+  if (exp < 0) {
+    exp = 0;
+  }
+
+  base = base.negate();
+
+  while (exp--) {
+    // Multiplication by 10
+    var tmp = base.double();
+    base = tmp.double().add(tmp);
+  }
+
+  npub = 0;
+  for (i = 0; i < rings; i++) {
+    for (j = 1; j < rsizes[i]; j++) {
+      pubs[npub + j] = pubs[npub + j - 1].add(base);
+    }
+    if (i < rings - 1) {
+      base = base.double().double();
+    }
+    npub += rsizes[i];
+  }
+}
+
+async function rangeproofSign(
+  minValue,
+  commit,
+  blind,
+  nonce,
+  exp,
+  minBits,
+  value,
+  msg,
+  extraCommit,
+  genp,
+) {
+  let proof = new Uint8Array(5134);
+  var pubs = new Array(128);
+  var s = new Array(128);
+  var sec = new Array(32);
+  var k = new Array(32);
+  var sha256M = sha256.create();
+  var prep = new Uint8Array(4096);
+  var tmp = new Uint8Array(33);
+  var signs;
+  var len;
+  var i;
+
+  len = 0;
+  if (minValue > value || minBits > 64 || minBits < 0 || exp < -1 || exp > 18) {
+    return 0;
+  }
+
+  let v, rings, rsizes, npub, secidx, mantissa, scale;
+  ({ v, rings, rsizes, npub, secidx, mantissa, scale, exp, minBits, minValue } =
+    await rangeProveParams(minBits, minValue, exp, value));
+  if (!v) return 0;
+
+  proof[len] = (rsizes[0] > 1 ? 64 | exp : 0) | (minValue ? 32 : 0);
+  len++;
+  if (rsizes[0] > 1) {
+    if (mantissa <= 0 || mantissa > 64) {
+      throw new Error("Mantissa out of range");
+    }
+    proof[len] = mantissa - 1;
+    len++;
+  }
+  if (minValue) {
+    for (i = 0; i < 8; i++) {
+      proof[len + i] = Number((minValue >> BigInt((7 - i) * 8)) & BigInt(255));
+    }
+    len += 8;
+  }
+  if (msg.length > 0 && msg.length > 128 * (rings - 1)) {
+    return 0;
+  }
+
+  sha256M.update(commit);
+  sha256M.update(genp);
+  sha256M.update(proof.slice(0, len));
+
+  prep.fill(0);
+  if (msg != null) {
+    prep.set(msg.slice(0, msg.length));
+  }
+  if (rsizes[rings - 1] > 1) {
+    var idx;
+    idx = rsizes[rings - 1] - 1;
+    idx -= secidx[rings - 1] == idx;
+    idx = ((rings - 1) * 4 + idx) * 32;
+    for (i = 0; i < 8; i++) {
+      prep[8 + i + idx] =
+        prep[16 + i + idx] =
+        prep[24 + i + idx] =
+          Number((v >> BigInt(56 - i * 8)) & BigInt(255));
+      prep[i + idx] = 0;
+    }
+    prep[idx] = 128;
+  }
+
+  if (
+    !(await rangeproofGenrand(
+      sec,
+      s,
+      prep,
+      rsizes,
+      rings,
+      nonce,
+      commit,
+      proof,
+      len,
+      genp,
+    ))
+  ) {
+    return 0;
+  }
+
+  prep.fill(0);
+  for (i = 0; i < rings; i++) {
+    k[i] = s[i * 4 + secidx[i]];
+    s[i * 4 + secidx[i]] = 0n;
+  }
+
+  sec[rings - 1] += b2n(blind);
+  signs = proof.slice(len);
+  for (i = 0; i < (rings + 6) >> 3; i++) {
+    signs[i] = 0;
+    len++;
+  }
+  npub = 0;
+  for (i = 0; i < rings; i++) {
+    // console.log("i", i);
+    // console.log("idx", secidx[i]);
+    // console.log("scale", scale);
+    let scalar = (BigInt(secidx[i]) * scale) << BigInt(i * 2);
+    // console.log("scalar", scalar);
+    // console.log("sec i", sec[i]);
+    // console.log("curve n", CURVE.n);
+    let P1 = sec[i] ? ProjectivePoint.fromHex(genp).mul(sec[i]) : I;
+    let P2 = secidx[i] ? G.mul(scalar) : I;
+    pubs[npub] = P1.add(P2);
+    if (pubs[npub].equals(I)) {
+      return 0;
+    }
+    if (i < rings - 1) {
+      var tmpc = pubs[npub].toRawBytes(true);
+      var quadness = tmpc[0];
+      sha256M.update(tmpc);
+      signs[i >> 3] |= quadness << (i & 7);
+      proof.set(tmpc.slice(1), len);
+      len += 32;
+    }
+    npub += rsizes[i];
+  }
+  rangeproofPubExpand(pubs, exp, rsizes, rings, genp);
+  if (extraCommit != null) {
+    sha256M.update(extraCommit);
+  }
+  sha256M = sha256M.digest();
+  if (
+    !(await borromeanSign(
+      proof.slice(len),
+      s,
+      pubs,
+      k,
+      sec,
+      rsizes,
+      secidx,
+      rings,
+      sha256M,
+    ))
+  ) {
+    return 0;
+  }
+  len += 32;
+  for (let i = 0; i < npub; i++) {
+    proof.set(n2b(s[i], 32), len);
+    len += 32;
+  }
+  return proof;
+}
+
+async function testRangeproof() {
+  const value = 123455000n;
+  const minval = 1;
+  const exp = 0;
+  const bits = 36;
+  const genp =
+    "038d276fa2ab45fed0f622f818be77f456baa2f3b90456e30d2c561446b25b5458"; // asset commitment as parsed generator point
+  // 0a8d276fa2ab45fed0f622f818be77f456baa2f3b90456e30d2c561446b25b5458
+  const blind =
+    "de22de5f5fe49cc6ac2bb8952567151c7c36b42e2e2f2aa587d4ed2060b2ba4d";
+  const nonce =
+    "f295f2c7a42274f8f90a9d7f8649d78b67e693703246bf6086653c8646a363f5";
+  const script = "a914d7da691a2b7256aa3bce759ef2b8ff5213fa327987";
+  const msg =
+    "25b251070e29ca19043cf33ccd7324e2ddab03ecc4ae0b5e77c4fc0e5cf6c95ac4681a2583b714a31c5a0b997a6c107a96be4aef4847d9cde3035e8ef23642bf";
+  const commit =
+    "0253c4bf412d07fad5e05fe0f5ea2107a546f9cfef38ef2b962ffd84a89de03d7f"; // value commitment as parsed pedersen commitment
+  // 0953c4bf412d07fad5e05fe0f5ea2107a546f9cfef38ef2b962ffd84a89de03d7f
+  const expected =
+    "60230000000000000001a33701f0954c84cd6f383a536677e4279108eed11f62d2a5b1e3f15c622c850c0ad11fda43884cf1a0b356adddc9027b0ae6fb5ff044cd0494d863c0edf46a22306e3793062df327e14382a45c7a78a6ba60eb54938d891fd7816fda940332d67484b3b9c153501f84a175d756f109272cf03333ee2c9351d01c6762d797e0ba0a9e84881fcc79dafb887c5bcc244bc0f23e8aee40cfbeaf4df937bc4ab04874769a39a7f364b5f7b824c4cbdfab1240efe46d58b9057f14a459575825eb526184181803f05ba3e369b9d4084e2754faf1813db09f8120f3c871a3fbf35ee31f6027980fdfa80758b564b7501384bd5e1af005f76e6f1e388a25c02ddc290a97fe2d05b744d0ff5107a6912c4a766c3485eafd8c04c6cc99283adea66d8b8c88a124a296a78ac10b3a82ec3ff6eca5b7b330d56ed59ebd003bbde7915dedb5794c506320f9172e58b58082aa20b5bcbf2ed57a9d0f1bd5ecf8bed80392731cd82176c45457077e96b4a4a992975feccd2c8ce2e423e85b5455561e2d31a6c68b17f2abaddbff1a065da052bb83327966a96dc3f252b0c3f91868d30cb1f0d90b75a194bdf96058158897d596941d5675f5b9de37f3e9243f454611dad3acee6cbceb1a5ac1ef0b03f8b512166cdf8386d5492e7b591f5b3daf33658a6f2c4f9a028d0883f1349f73a28ebc1630165e500d59503c1ca4c203ee53b881eb42c2d8097f806183ce2628247485d85d87b113d1309d26332ffb734355b17cfe41c1f82fbd6da5ebba7c91664a2f7be6863e9eccbb2b925d8b0451bc2333f860d21e18c1d0713c7eb2d4f120236cb0dfe3945b696be77c47cf1a29e235c35804f23ff1ac8525a60a040d5f0780eda7b71fe2d956ccaa5dd7f9fe4db310e46fa19f0b493f7a90a66afd71fc5e84b9f39c814ecbc0605bb3b0efb78424846d0f1b831bbccd8e0fd4fc0f4aeafe4893208cd84ebc75f5619f9af9e0f68adc0484b71b23018bbeefcd6e071a6de624f16c92328177ee48e8e35445b5b330aed000daa2f4ebe5c17e8532b9c5a0ab4a477c1cdc32e0125506d159816011cf581924ef9b138cdca8232384a600c39a57b71044fee0d976022e376fcdc2d83544330e5bc94384d089de45c1872f40a3961e8fd6f4cbf3ac131a44688a7214c15325ba89ac7a55aa87904f6f33828e1f432bb8f0f040d8403c87300a7ac0a146dd87af4f1aff96f428f4dbb1dd35538b44b0de4076793b2f1c70cc5d3916d6bd70e770bd891f8461a27a839bb1efdef78234c6d07c75891e9a0a9dfd9f2de5cdd4a6b898dad80254afb6ae9d763bc3860e0b19ae7de55a27d935576e8b7575846d2befd251d8d4b0f62b3f78436439ffab4cb4edc663d58c053474f3631d98cddcae7c9342cbac6bc2e52f103749933db21486130a56be1bcaee78137ef8306dc5bec2b3afe9afcc4344d4aca0e4f173d503583872141f4da19a45aa2b0f2fb1a15dc3d9e2f6a189948eee285da37968cc35b34c93db92421003893ff6aca7c90c89d46b771669cd43ae3f4d4a2e047183bc15ae38cac485b7ea050150013547506b3fffb38ca9f4f433624aedf0ee54feb5e140225116e869fe1d3c5e45c0564d130fa1a6b13191ed592a9bf0c49198db1a62d1a6da7ed7cd3027937c4f8817888678514b1c503f013c98bd230af3a180ebe57f559632cb65a0dc806fd34b6f2d57da6e385207cfb90368f5efbaa6fc7a118e6b8805628321bef76db29aafc4edf9c76a10f66bf18fd8b3cac4c9ef23574272d4b89f055d2cd1f5759d027b93301c7b3bbe7cd137c9dca5fa59141dc32bddb9c6167a01a612413b3c2d830c3d0d4c1631994556180c5fba28ee3780875cfb43525b1cc586901aa6b933be18d514975f84ca40ba0806866d48b62419ccb92f97a67538387529959de7df9b5760a11d669a666f7d0694263dbd798d1faaf31e6f6c3ec7e374132475d2fc05d29e5b7b43d8d8f342a715208ce598893efae6991d1b49c94687e31a0b8749740b70e58e4d0ccb053ab0d8cd470f9ad08fe66ea91c3d1b56ccc6f2d98d054783d5bc7c57b9660cd316a61485e96be30379537859a58021734e4b4357c3a196a17e089299cd22023cfa3e7b2508ee70b904fea821df6edd03d8fdaccf4b4560388c00681c47b9462697897a461f4247ab69207a9e1316781daf3eb32a22bdd60dc7b9f9e3bff087e137a65714abcfd47f493b9cdb1f844e7f117499150a8a3d5380c982d65e42a4366f683ef4dfd7f8de1289e30c3cd531afeabac4202541ca7dae26877fd2e184a9911e0cf295be51d2febcedcfce480abcf7ce1bf7e4c0a311ab9542f4869e3e78b5638a07fe304f14d2aa7ca1577ca87bfc8e6de0ee8f6f2c10223bcc51eb13b2683373adf10cd50098848c1e7640831db154c63c55655f610c03dbc83d7e761003d8ffb9e5012ffcff45b70917abcd429aa7d1c432ef7e0be417c989a59a3264edc2a731fe9ed0b2296cfaf2c27f5b225b018f190c6d37f177427875bf362c8197e5c984ad483142310e351e42697339305bc9885a9d9da9a16b96a9a72d279f2b1be829dfa81312edd35d125580e55b82fe6a99688bd7ac2082d33cac20b1f5ca5b52b12ba1846ff4c942b04fae07a0b12d61449ed750cc366e865dc28a96a75761e82409fd055d24410228d1599ec5781c33eb6f0cea57a7982e13adeb81d2a0f6e052895e4b81c17656452caa74709191029ce41c962f3d8619d67445ab3debe5c75e6c128d618b9b98f1808a2b88a004996daa07d16e616ab1d6a1af563c3779a08a2f0dd2c9574ff7843907a20474d2ca34b1bddc999dad355a28178ed6c0f254cebbd64e8ba30f11394d40a6bbe63aed53ed3d08a1a561801857e8648fe8621c34ce3230dc498ccf189e596e50fef40f975f8be9369da5abc372f367c84e0844d732c761cd192dd9f83cf8e5470b5b13d5c480354a9cc03f1e96799cb1d5cc9ea380dd99e14d2c66bc735899562d74666b2d2e1515d4b50fb3c1b40530d2d3d38991be8e03305ef3d54111642614f24106658bcf0ee766085fc74b5199f15584defaeab8d22a0b05d352d3762a55a86d056b8b0006bff5d94ace6fab9bb10049fe4128852a4190a9cc42a7a89a5bf191b776e2cf39f784d21d3fa9d4cd7e2328c81f292743977c36202088586ba7db1b7295eeb2ab76d2c31d87bb3acc10a44a39b67565ab4320951a7969d3ab50fbef9215c162fb4b5260ea70e34ec023494334af968ebe3f27b7ffd5c44b5a4eeb62aa8bd530fa3b87412c8f635e116f9c05ce66ad0b735e84af5078be9d9efd41037c593fda7d58b73a7080fc6151fc3ba5b0ca175b3da4e8b602735ebe7a6c2b82fa5903604917eb84542679c90a0151dfa3f6cad01ca89e92ff57f7707c54d1c6550e0686122cbdb16bc2983002c55aa23f659945af8b0cf8c37838d7607aa1215a0e2fbc3f403489902141245966007a800f3686558e565a67c9f51dfa878450e3abee41c1fe5ffa57a37eebbb657bce26ca32bfcd7a4c587ba65a15d9280cbd50acfbc876d3f062eed1099c6519e84a303805a38547846ba9490b1eaa7da50db123a1ff201b272309f9442f22630aeeaf46950f2fc825403eb337b8737677f5afcd822cb137a547d203015a0e7455bda60b93676852484647f0d49d57b8e7c8eabdb7a736585b501001114b4e2cf304f073e543420410ed180adbf5a87e1c11b332a08e29a93241c17532c880e493b14c644cbb3eb45843c7bae6ab436cadbfedc3da860da7092301b05055569ce3ba6c3425cf295845366554c0e4108188a0441326923d69777ae9761c99ed6a78782fa15c1c2d708a4fde61fdc8cff4e1534eacc15229041415a19d89c975294558f4abcc5de2d7231ee7b5e0ef7ba1ffb3c2f8891e24002d14254d81db63fc804a1037e808816573f7c73b3f225d09b29e03fe9ae9f79c40e69eb466fc3cafc5cdc0450b46d575fdee83001a755b61fe4e4cd98fa880ebd4b6f3904716ac3a619a42e1800c7360563410f703163e2b8975cd8d272f58768ebed263ee8a8381054d81";
+
+  let proof = await rangeproofSign(
+    minval,
+    commit,
+    blind,
+    nonce,
+    exp,
+    bits,
+    value,
+    msg,
+    script,
+    genp,
+  );
+
+  console.log("PROOF", proof);
+}
+
+testRangeproof();
+
+const SECP256K1_N = BigInt(
+  "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+);
+
+function secp256k1_scalar_check_overflow(a) {
+  const SECP256K1_N_0 = BigInt("0xBFD25E8CD0364141");
+  const SECP256K1_N_1 = BigInt("0xAF48A03BBFD25E8C");
+  const SECP256K1_N_2 = BigInt("0xFFFFFFFFFFFFFFFE");
+  const SECP256K1_N_3 = BigInt("0xFFFFFFFFFFFFFFFF");
+
+  let no = 0;
+  let yes = 0;
+
+  no |= a[3] < SECP256K1_N_3 ? 1 : 0;
+  no |= a[2] < SECP256K1_N_2 ? 1 : 0;
+  yes |= a[2] > SECP256K1_N_2 && !no ? 1 : 0;
+  no |= a[1] < SECP256K1_N_1 ? 1 : 0;
+  yes |= a[1] > SECP256K1_N_1 && !no ? 1 : 0;
+  yes |= a[0] >= SECP256K1_N_0 && !no ? 1 : 0;
+
+  return BigInt(yes);
+}
+
+function secp256k1_scalar_reduce(r, overflow) {
+  const SECP256K1_N_C_0 = BigInt("0x0");
+  const SECP256K1_N_C_1 = BigInt("0x0");
+  const SECP256K1_N_C_2 = BigInt("0x0");
+
+  let t = BigInt(r[0]);
+  console.log("OF", overflow, typeof overlow);
+  t += overflow * SECP256K1_N_C_0;
+  r[0] = t & BigInt("0xFFFFFFFFFFFFFFFF");
+  t >>= 64n;
+
+  t += BigInt(r[1]);
+  t += overflow * SECP256K1_N_C_1;
+  r[1] = t & BigInt("0xFFFFFFFFFFFFFFFF");
+  t >>= 64n;
+
+  t += BigInt(r[2]);
+  t += overflow * SECP256K1_N_C_2;
+  r[2] = t & BigInt("0xFFFFFFFFFFFFFFFF");
+  t >>= 64n;
+
+  t += BigInt(r[3]);
+  r[3] = t & BigInt("0xFFFFFFFFFFFFFFFF");
+
+  return overflow;
+}
+
+// Write a uint64_t in big endian
+function secp256k1_write_be64(x) {
+  // Convert the BigInt to a buffer
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(BigInt(x));
+  return buf;
+}
+
+function secp256k1_scalar_get_b32(a) {
+  let bin = new Uint8Array(32);
+
+  console.log("GETTING", a);
+
+  let d3Bytes = secp256k1_write_be64(a[3]);
+  let d2Bytes = secp256k1_write_be64(a[2]);
+  let d1Bytes = secp256k1_write_be64(a[1]);
+  let d0Bytes = secp256k1_write_be64(a[0]);
+
+  console.log(d2Bytes);
+
+  bin.set(d3Bytes, 0);
+  bin.set(d2Bytes, 8);
+  bin.set(d1Bytes, 16);
+  bin.set(d0Bytes, 24);
+
+  return bin;
+}
+
+function secp256k1_scalar_set_b32(b32) {
+  let r = [0n, 0n, 0n, 0n];
+  let overflow = [0n];
+
+  r[0] = BigInt("0x" + b32.slice(24, 32).toString("hex"));
+  r[1] = BigInt("0x" + b32.slice(16, 24).toString("hex"));
+  r[2] = BigInt("0x" + b32.slice(8, 16).toString("hex"));
+  r[3] = BigInt("0x" + b32.slice(0, 8).toString("hex"));
+
+  console.log("R", r);
+  const over = secp256k1_scalar_reduce(r, secp256k1_scalar_check_overflow(r));
+  if (overflow !== undefined) {
+    overflow[0] = over;
+  }
+  console.log("R", r);
+
+  return { r, overflow };
+}
