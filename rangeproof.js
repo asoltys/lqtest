@@ -5,6 +5,7 @@ const {
   bytesToNumberBE: b2n,
   hexToBytes: h2b,
   numberToBytesBE: n2b,
+  hmacSha256Async,
 } = etc;
 const { BASE: G, ZERO: I } = ProjectivePoint;
 const { n: N } = CURVE;
@@ -49,7 +50,6 @@ function normalizeAndConvertToBytes(fe) {
   return n2b(fe).slice(0, 32);
 }
 
-
 // Function to serialize a point according to the custom format
 function serializePoint(point) {
   const data = new Uint8Array(33);
@@ -60,8 +60,8 @@ function serializePoint(point) {
 
   // Normalize x
   const xBigInt = BigInt(point.x);
-  const xHex = xBigInt.toString(16).padStart(64, '0'); // Convert x to 32-byte hex string
-  const xBytes = Uint8Array.from(Buffer.from(xHex, 'hex')); // Convert hex string to Uint8Array
+  const xHex = xBigInt.toString(16).padStart(64, "0"); // Convert x to 32-byte hex string
+  const xBytes = Uint8Array.from(Buffer.from(xHex, "hex")); // Convert hex string to Uint8Array
 
   // Serialize x
   data.set(xBytes, 1);
@@ -670,6 +670,7 @@ function testBorromeanSign() {
 
 // testBorromeanSign();
 
+/*
 async function rangeproofGenrand(
   sec,
   s,
@@ -749,9 +750,10 @@ async function rangeproofGenrand(
   acc = 0n;
   return ret;
 }
+*/
 
 function rangeproofPubExpand(pubs, exp, rsizes, rings, genp) {
-  var base = secp256k1.ProjectivePoint.fromAffine(genp);
+  var base = ProjectivePoint.fromAffine(genp);
   var i, j, npub;
   if (exp < 0) {
     exp = 0;
@@ -876,7 +878,7 @@ async function rangeproofSign(
     s[i * 4 + secidx[i]] = 0n;
   }
 
-  sec[rings - 1] += b2n(blind);
+  sec[rings - 1] = sec[rings-1] + b2n(blind) % CURVE.n;
   signs = proof.slice(len);
   for (i = 0; i < (rings + 6) >> 3; i++) {
     signs[i] = 0;
@@ -889,7 +891,8 @@ async function rangeproofSign(
     // console.log("scale", scale);
     let scalar = (BigInt(secidx[i]) * scale) << BigInt(i * 2);
     // console.log("scalar", scalar);
-    // console.log("sec i", sec[i]);
+    console.log(i, sec[i])
+    console.log("sec", i, b2h(n2b(sec[i])));
     // console.log("curve n", CURVE.n);
     let P1 = sec[i] ? ProjectivePoint.fromHex(genp).mul(sec[i]) : I;
     let P2 = secidx[i] ? G.mul(scalar) : I;
@@ -1069,4 +1072,123 @@ function secp256k1_scalar_set_b32(b32) {
   console.log("R", r);
 
   return { r, overflow };
+}
+
+class RNG {
+  constructor(k, v, retry = false) {
+    this.k = k;
+    this.v = v;
+    this.retry = retry;
+  }
+
+  static async create(key) {
+    const zero = new Uint8Array([0x00]);
+    const one = new Uint8Array([0x01]);
+
+    let v = new Uint8Array(32).fill(0x01); // RFC6979 3.2.b.
+    let k = new Uint8Array(32).fill(0x00); // RFC6979 3.2.c.
+
+    // RFC6979 3.2.d.
+    k = await hmacSha256Async(k, v, zero, key);
+    v = await hmacSha256Async(k, v);
+
+    // RFC6979 3.2.f.
+    k = await hmacSha256Async(k, v, one, key);
+    v = await hmacSha256Async(k, v);
+
+    return new RNG(k, v, false);
+  }
+
+  async generate(out, outlen) {
+    const zero = new Uint8Array([0x00]);
+    if (this.retry) {
+      this.k = await hmacSha256Async(this.k, this.v, zero);
+      this.v = await hmacSha256Async(this.k, this.v);
+    }
+
+    while (outlen > 0) {
+      let now = outlen > 32 ? 32 : outlen;
+      this.v = await hmacSha256Async(this.k, this.v);
+      out.set(this.v.slice(0, now), out.length - outlen);
+      outlen -= now;
+    }
+
+    this.retry = true;
+  }
+
+  finalize() {
+    this.k.fill(0);
+    this.v.fill(0);
+    this.retry = false;
+  }
+}
+
+let negateScalar = (a) => (a === 0n ? 0n : (CURVE.n - a) % CURVE.n);
+
+async function rangeproofGenrand(
+  sec,
+  s,
+  message,
+  rsizes,
+  rings,
+  nonce,
+  commit,
+  proof,
+  len,
+  gen,
+) {
+  let tmp = new Uint8Array(32);
+  let rngseed = new Uint8Array(32 + 33 + 33 + len);
+  let acc = 0n;
+  let overflow;
+  let ret = 1;
+  let npub = 0;
+
+  if (len > 10) {
+    throw new Error("Invalid length");
+  }
+
+  const genP = ProjectivePoint.fromHex(gen);
+  const commitP = ProjectivePoint.fromHex(commit);
+  rngseed.set(h2b(nonce).slice(0, 32), 0);
+  rngseed.set(serializePoint(commitP), 32);
+  rngseed.set(serializePoint(genP), 32 + 33);
+  rngseed.set(proof.slice(0, len), 32 + 33 + 33);
+
+  let rng = await RNG.create(rngseed);
+
+  for (let i = 0; i < rings; i++) {
+    if (i < rings - 1) {
+      await rng.generate(tmp, 32);
+      do {
+        await rng.generate(tmp, 32);
+        sec[i] = b2n(tmp) % CURVE.n;
+      } while (b2n(tmp) > CURVE.n || sec[i] === 0n);
+      acc = (acc + sec[i]) % CURVE.n;
+    } else {
+      sec[i] = negateScalar(acc);
+    }
+
+    console.log("i:", i);
+    console.log(sec[i])
+    console.log("sec", b2h(n2b(sec[i])));
+
+    for (let j = 0; j < rsizes[i]; j++) {
+      await rng.generate(tmp, 32);
+      if (message) {
+        for (let b = 0; b < 32; b++) {
+          tmp[b] ^= message[(i * 4 + j) * 32 + b];
+          message[(i * 4 + j) * 32 + b] = tmp[b];
+        }
+      }
+      s[npub] = b2n(tmp) % CURVE.n;
+      ret &= s[npub] !== 0n;
+      npub++;
+    }
+  }
+  acc = 0n;
+
+  console.log("17", sec[17])
+
+  return ret;
 }
